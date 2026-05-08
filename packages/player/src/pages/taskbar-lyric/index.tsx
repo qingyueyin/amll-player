@@ -43,6 +43,7 @@ import {
 	THEME_EVENT,
 } from "../../components/TaskbarLyricBridge/types.ts";
 import styles from "./index.module.css";
+import "@applemusic-like-lyrics/react-full/style.css";
 import { LyricScroll } from "./LyricScroll.tsx";
 
 const LYRIC_OFFSET = 300;
@@ -530,7 +531,6 @@ export const TaskbarLyricApp = () => {
 			data-orientation={orientation}
 			data-visible={isVisible}
 		>
-			{/** biome-ignore lint/a11y/noStaticElementInteractions: 仅鼠标交互 */}
 			<div
 				className={styles.container}
 				data-theme={theme}
