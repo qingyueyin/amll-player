@@ -13,7 +13,7 @@
 		"locale:gen": "i18next-cli extract"
 	},
 	"dependencies": {
-		"@applemusic-like-lyrics/core": "0.4.2",
+		"@applemusic-like-lyrics/core": "0.5.0",
 		"@applemusic-like-lyrics/fft": "^0.2.0",
 		"@applemusic-like-lyrics/lyric": "1.0.0",
 		"@applemusic-like-lyrics/react-full": "0.3.2",
