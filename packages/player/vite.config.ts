@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react";
 import jotaiDebugLabel from "jotai-babel/plugin-debug-label";
 import jotaiReactRefresh from "jotai-babel/plugin-react-refresh";
 import { defineConfig, type Plugin } from "vite";
-import babel from "vite-plugin-babel";
+import babel from "@rolldown/plugin-babel";
 import i18nextLoader from "vite-plugin-i18next-loader";
 import svgr from "vite-plugin-svgr";
 import wasm from "vite-plugin-wasm";
@@ -40,7 +40,7 @@ const GitMetadataPlugin = (): Plugin => {
 	let gitBranch = "";
 	return {
 		name: "git-metadata-plugin",
-		async buildStart() {
+		["buildStart"]: async function() {
 			const metadata = {
 				commit: "",
 				branch: "",
@@ -82,7 +82,8 @@ const GitMetadataPlugin = (): Plugin => {
 // https://vitejs.dev/config/
 export default defineConfig({
 	build: {
-		rollupOptions: {
+		chunkSizeWarningLimit: 2000,
+		rolldownOptions: {
 			shimMissingExports: true,
 			input: {
 				index: resolve(__dirname, "index.html"),
@@ -94,9 +95,8 @@ export default defineConfig({
 	plugins: [
 		react(),
 		babel({
-			babelConfig: {
-				plugins: [jotaiDebugLabel, jotaiReactRefresh],
-			},
+			plugins: [jotaiDebugLabel, jotaiReactRefresh],
+			include: /\.[jt]sx?$/,
 		}),
 		wasm(),
 		svgr({
