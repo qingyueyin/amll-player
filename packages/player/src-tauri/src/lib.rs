@@ -73,20 +73,13 @@ fn restart_app<R: Runtime>(app: AppHandle<R>) {
     tauri::process::restart(&app.env())
 }
 
+#[cfg(target_os = "windows")]
 #[tauri::command]
 fn set_window_always_on_top<R: Runtime>(enabled: bool, app: AppHandle<R>) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            window.set_always_on_top(enabled).map_err(|e| e.to_string())
-        } else {
-            Err("Main window not found.".to_string())
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (enabled, app);
-        Err("Unsupported on this platform.".to_string())
+    if let Some(window) = app.get_webview_window("main") {
+        window.set_always_on_top(enabled).map_err(|e| e.to_string())
+    } else {
+        Err("Main window not found.".to_string())
     }
 }
 
@@ -588,11 +581,11 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(|_window, _event| {
             #[cfg(target_os = "windows")]
-            if let tauri::WindowEvent::Destroyed = event
-                && window.label() == "main"
-                && let Some(taskbar_win) = window.app_handle().get_webview_window("taskbar-lyric")
+            if let tauri::WindowEvent::Destroyed = _event
+                && _window.label() == "main"
+                && let Some(taskbar_win) = _window.app_handle().get_webview_window("taskbar-lyric")
             {
                 let _ = taskbar_win.destroy();
             }
