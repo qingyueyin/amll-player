@@ -12,11 +12,14 @@ use amll_player_core::AudioInfo;
 use anyhow::Context;
 use ffmpeg_next as ffmpeg;
 use serde::*;
+#[cfg(not(mobile))]
 use serde_json::Value;
 use tauri::{
-    AppHandle, Manager, PhysicalSize, Runtime, Size, State, WebviewWindowBuilder, ipc::Channel,
-    path::BaseDirectory, utils::config::WindowEffectsConfig, window::Effect,
+    AppHandle, Manager, Runtime, State, WebviewWindowBuilder, ipc::Channel,
+    path::BaseDirectory,
 };
+#[cfg(desktop)]
+use tauri::{PhysicalSize, Size, utils::config::WindowEffectsConfig, window::Effect};
 use tokio::sync::RwLock;
 use tracing::*;
 
@@ -300,6 +303,8 @@ async fn recreate_window(app: &AppHandle, label: &str, path: Option<&str>) {
             let _ = win.show();
             let _ = win.set_focus();
         }
+        #[cfg(not(desktop))]
+        let _ = win;
         return;
     }
     #[cfg(debug_assertions)]
@@ -328,6 +333,8 @@ async fn recreate_window(app: &AppHandle, label: &str, path: Option<&str>) {
             let _ = win.set_size(orig_size);
         }
     }
+    #[cfg(not(desktop))]
+    let _ = win;
 
     info!("Created window: {}", label);
 }

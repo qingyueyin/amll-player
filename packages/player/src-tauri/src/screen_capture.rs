@@ -1,4 +1,5 @@
 use tauri::AppHandle;
+#[cfg(not(mobile))]
 use tauri::Manager;
 
 use anyhow_tauri::IntoTAResult;
@@ -13,6 +14,7 @@ pub async fn take_screenshot(
 ) -> anyhow_tauri::TAResult<String> {
     #[cfg(mobile)]
     {
+        let _ = (app, resize_window, target_width, target_height, recover_size);
         anyhow_tauri::bail!("Screenshot capture is not supported on Android");
     }
     #[cfg(not(mobile))]
