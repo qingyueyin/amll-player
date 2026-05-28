@@ -261,7 +261,8 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-          targets: "x86_64-unknown-linux-gnu,x86_64-linux-android,i686-linux-android,aarc\
+          targets:
+            "x86_64-unknown-linux-gnu,x86_64-linux-android,i686-linux-android,aarc\
             h64-linux-android,arm-linux-androideabi,armv7-linux-androideabi,thu\
             mbv7neon-linux-androideabi"
 
@@ -284,7 +285,7 @@ jobs:
       - name: 安装 FFmpeg 所需系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential yasm nasm
+          sudo apt-get install -y build-essential yasm nasm gcc-multilib g++-multilib
 
       - name: 设置 Android SDK/NDK
         uses: android-actions/setup-android@v3
@@ -365,7 +366,7 @@ jobs:
       - name: 选择 Xcode 16 版本
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16'
+          xcode-version: "16"
 
       - name: 安装 PNPM
         uses: pnpm/action-setup@v4
@@ -413,7 +414,6 @@ jobs:
           echo "FFMPEG_DIR_AARCH64_APPLE_IOS=$EXTRACT_DIR" >> $GITHUB_ENV
           echo "FFMPEG_DIR_aarch64_apple_ios=$EXTRACT_DIR" >> $GITHUB_ENV
           echo "FFmpeg iOS environment set up successfully."
-
 
       - name: 安装 pnpm 依赖
         run: |
