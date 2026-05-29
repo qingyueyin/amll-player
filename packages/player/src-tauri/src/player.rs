@@ -68,15 +68,21 @@ pub fn init_local_player<R: Runtime>(app: AppHandle<R>) {
 }
 
 async fn local_player_main<R: Runtime>(app: AppHandle<R>, stream: MixerDeviceSink) {
-    let player = AudioPlayer::new(AudioPlayerConfig {}, stream);
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let player = AudioPlayer::new(AudioPlayerConfig {}, stream, evt_tx);
+
     let handler = player.handler();
     PLAYER_HANDLER.write().await.replace(handler);
+
     let app_clone = app.clone();
-    player
-        .run(move |evt| {
+    tokio::task::spawn(async move {
+        while let Some(evt) = evt_rx.recv().await {
             if let Err(err) = app_clone.emit("plugin:player-core-event", &evt) {
                 error!("发送事件时出错: {err:?}");
             }
-        })
-        .await;
+        }
+    });
+
+    player.run().await;
 }

@@ -8,6 +8,7 @@ use serde::*;
 mod audio_quality;
 mod ffmpeg_decoder;
 mod fft_player;
+mod media_controls;
 mod player;
 pub mod utils;
 pub use player::*;
