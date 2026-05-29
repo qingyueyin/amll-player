@@ -262,7 +262,7 @@ export const LocalMusicContext: FC = () => {
 	const syncMusicInfo = async (
 		data: Extract<AudioThreadEvent, { type: "loadAudio" }>["data"],
 	) => {
-		if (!data || !data.musicInfo) {
+		if (!data?.musicInfo) {
 			console.error("[syncMusicInfo] Invalid data, aborting.");
 			return;
 		}
@@ -347,8 +347,9 @@ export const LocalMusicContext: FC = () => {
 
 		const updateLoop = () => {
 			const isPlaying = store.get(musicPlayingAtom);
+			const now = performance.now();
+
 			if (isPlaying) {
-				const now = performance.now();
 				const dt = (now - lastSyncRef.current.timestamp) / 1000;
 				const newPos = lastSyncRef.current.position + dt;
 
@@ -357,7 +358,9 @@ export const LocalMusicContext: FC = () => {
 
 				store.set(musicPlayingPositionAtom, (clampedPos * 1000) | 0);
 			} else {
-				lastSyncRef.current.timestamp = performance.now();
+				const currentUIPosition = store.get(musicPlayingPositionAtom) / 1000;
+				lastSyncRef.current.position = currentUIPosition;
+				lastSyncRef.current.timestamp = now;
 			}
 			rafId = requestAnimationFrame(updateLoop);
 		};
