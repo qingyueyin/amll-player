@@ -22,10 +22,7 @@ use parking_lot::RwLock as ParkingLotRwLock;
 use rodio::{MixerDeviceSink, Player, Source};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock as TokioRwLock;
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 use tracing::{info, warn};
 
 pub struct AudioPlayer {
@@ -39,10 +36,9 @@ pub struct AudioPlayer {
     volume: f64,
     current_song: Option<SongData>,
     current_audio_info: Arc<TokioRwLock<AudioInfo>>,
-    current_samples_counter: Arc<TokioRwLock<Option<Arc<AtomicU64>>>>,
-
     current_audio_quality: Arc<TokioRwLock<AudioQuality>>,
-    play_pos_sx: UnboundedSender<(bool, Option<f64>)>,
+    playback_state: Arc<ParkingLotRwLock<PlaybackState>>,
+
     tasks: Vec<JoinHandle<()>>,
     npc_event_rx: Option<UnboundedReceiver<SystemMediaEvent>>,
     fft_player: Arc<ParkingLotRwLock<FFTPlayer>>,
@@ -50,6 +46,13 @@ pub struct AudioPlayer {
     fft_broadcast_task: Option<JoinHandle<()>>,
     target_channels: u16,
     target_sample_rate: u32,
+}
+
+#[derive(Default, Debug)]
+pub struct PlaybackState {
+    pub is_playing: bool,
+    pub base_time_sec: f64,
+    pub samples_counter: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -110,10 +113,9 @@ impl AudioPlayer {
         info!("音频输出设备 声道数:{target_channels}, 采样率:{target_sample_rate}");
 
         let current_audio_info = Arc::new(TokioRwLock::new(AudioInfo::default()));
-        let current_samples_counter: Arc<TokioRwLock<Option<Arc<AtomicU64>>>> =
-            Arc::new(TokioRwLock::new(None));
         let current_audio_quality = Arc::new(TokioRwLock::new(AudioQuality::default()));
         let fft_player = Arc::new(ParkingLotRwLock::new(FFTPlayer::new()));
+        let playback_state = Arc::new(ParkingLotRwLock::new(PlaybackState::default()));
 
         let mut tasks = Vec::new();
 
@@ -121,75 +123,47 @@ impl AudioPlayer {
         let media_manager = Arc::new(manager);
 
         let audio_info_reader = current_audio_info.clone();
-        let samples_counter_reader = current_samples_counter.clone();
         let emitter_pos = AudioPlayerEventEmitter::new(evt_sender.clone());
-        let (play_pos_sx, mut play_pos_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(bool, Option<f64>)>();
-
         let media_manager_for_task = media_manager.clone();
+
+        let playback_state_for_task = playback_state.clone();
 
         tasks.push(tokio::task::spawn(async move {
             let mut time_it = tokio::time::interval(Duration::from_secs(1));
 
-            let mut is_playing = false;
-            let mut base_time = 0.0;
-            let mut local_current_pos = 0.0;
-
             loop {
-                tokio::select! {
-                    msg = play_pos_rx.recv() => {
-                        if let Some((new_is_playing, new_base_time_opt)) = msg {
-                            is_playing = new_is_playing;
+                time_it.tick().await;
 
-                            if let Some(new_base_time) = new_base_time_opt {
-                                base_time = new_base_time;
-                                local_current_pos = base_time;
+                let (is_playing, base_time, counter_clone) = {
+                    let state = playback_state_for_task.read();
+                    (
+                        state.is_playing,
+                        state.base_time_sec,
+                        state.samples_counter.clone(),
+                    )
+                };
 
-                                let _ = emitter_pos
-                                    .emit(AudioThreadEvent::PlayPosition {
-                                        position: base_time,
-                                    })
-                                    .await;
-                            }
-
-                            if is_playing {
-                                media_manager_for_task.update_timeline(
-                                    local_current_pos,
-                                    audio_info_reader.read().await.duration,
-                                );
-                            }
+                if is_playing {
+                    let duration = audio_info_reader.read().await.duration;
+                    if duration > 0.0 {
+                        let played_time = if let Some(counter) = &counter_clone {
+                            let samples = counter.load(Ordering::Relaxed) as f64;
+                            let rate = target_sample_rate as f64;
+                            let ch = target_channels as f64;
+                            samples / (rate * ch)
                         } else {
-                            break;
-                        }
-                    }
+                            0.0
+                        };
 
-                    _ = time_it.tick() => {
-                        if is_playing {
-                            let duration = audio_info_reader.read().await.duration;
-                            if duration > 0.0 {
-                                let played_time = if let Some(counter) = samples_counter_reader.read().await.as_ref() {
-                                    let samples = counter.load(Ordering::Relaxed) as f64;
-                                    let rate = target_sample_rate as f64;
-                                    let ch = target_channels as f64;
-                                    samples / (rate * ch)
-                                } else {
-                                    0.0
-                                };
+                        let local_current_pos = (base_time + played_time).min(duration);
 
-                                local_current_pos = (base_time + played_time).min(duration);
+                        let _ = emitter_pos
+                            .emit(AudioThreadEvent::PlayPosition {
+                                position: local_current_pos,
+                            })
+                            .await;
 
-                                let _ = emitter_pos
-                                    .emit(AudioThreadEvent::PlayPosition {
-                                        position: local_current_pos,
-                                    })
-                                    .await;
-
-                                media_manager_for_task.update_timeline(
-                                    local_current_pos,
-                                    duration,
-                                );
-                            }
-                        }
+                        media_manager_for_task.update_timeline(local_current_pos, duration);
                     }
                 }
             }
@@ -232,9 +206,8 @@ impl AudioPlayer {
             volume: 1.0,
             current_song: None,
             current_audio_info,
-            current_samples_counter,
             current_audio_quality,
-            play_pos_sx,
+            playback_state,
             tasks,
             npc_event_rx,
             fft_player,
@@ -284,7 +257,13 @@ impl AudioPlayer {
                 }
                 _ = check_end_interval.tick() => {
                     if self.audio_player.empty() && !self.audio_player.is_paused() && self.current_song.is_some() {
-                        let _ = self.play_pos_sx.send((false, Some(0.0)));
+
+                        {
+                            let mut state = self.playback_state.write();
+                            state.is_playing = false;
+                            state.base_time_sec = 0.0;
+                        }
+
                         self.current_song = None;
 
                         if let Err(e) = self.emitter().emit(AudioThreadEvent::TrackEnded).await {
@@ -305,7 +284,7 @@ impl AudioPlayer {
             match data {
                 AudioThreadMessage::ResumeAudio => {
                     self.audio_player.play();
-                    let _ = self.play_pos_sx.send((true, None));
+                    self.playback_state.write().is_playing = true;
                     self.media_manager.update_play_state(true);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus { is_playing: true })
@@ -313,7 +292,7 @@ impl AudioPlayer {
                 }
                 AudioThreadMessage::PauseAudio => {
                     self.audio_player.pause();
-                    let _ = self.play_pos_sx.send((false, None));
+                    self.playback_state.write().is_playing = false;
                     self.media_manager.update_play_state(false);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus { is_playing: false })
@@ -328,7 +307,7 @@ impl AudioPlayer {
                     }
 
                     let is_playing_now = was_paused;
-                    let _ = self.play_pos_sx.send((is_playing_now, None));
+                    self.playback_state.write().is_playing = is_playing_now;
                     self.media_manager.update_play_state(is_playing_now);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus {
@@ -343,19 +322,22 @@ impl AudioPlayer {
                         if handle.seek(seek_pos).is_err() {
                             warn!("发送跳转命令失败, 解码器可能已关闭");
                         } else {
-                            if let Some(counter) =
-                                self.current_samples_counter.read().await.as_ref()
-                            {
-                                counter.store(0, Ordering::SeqCst);
-                            }
-
                             let fft_player_clone = self.fft_player.clone();
                             tokio::task::spawn_blocking(move || {
                                 fft_player_clone.write().clear();
                             })
                             .await?;
                             let is_playing = !self.audio_player.is_paused();
-                            let _ = self.play_pos_sx.send((is_playing, Some(*position)));
+
+                            {
+                                let mut state = self.playback_state.write();
+                                state.is_playing = is_playing;
+                                state.base_time_sec = *position;
+                                if let Some(counter) = &state.samples_counter {
+                                    counter.store(0, Ordering::SeqCst);
+                                }
+                            }
+
                             self.media_manager.update_play_state(is_playing);
                         }
                     } else {
@@ -388,7 +370,11 @@ impl AudioPlayer {
                 }
                 AudioThreadMessage::StopAudio => {
                     self.audio_player.pause();
-                    let _ = self.play_pos_sx.send((false, None));
+                    {
+                        let mut state = self.playback_state.write();
+                        state.is_playing = false;
+                        state.base_time_sec = 0.0;
+                    }
                     self.media_manager.update_play_state(false);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus { is_playing: false })
@@ -457,7 +443,12 @@ impl AudioPlayer {
 
         let (source, handle, samples_counter) = source_result?;
         self.current_decoder_handle = Some(handle);
-        *self.current_samples_counter.write().await = Some(samples_counter);
+
+        {
+            let mut state = self.playback_state.write();
+            state.samples_counter = Some(samples_counter);
+            state.base_time_sec = 0.0;
+        }
 
         let info = source.audio_info();
         let quality = source.audio_quality();
@@ -471,7 +462,8 @@ impl AudioPlayer {
 
         let is_playing = !self.audio_player.is_paused();
         self.media_manager.update_play_state(is_playing);
-        let _ = self.play_pos_sx.send((is_playing, Some(0.0)));
+
+        self.playback_state.write().is_playing = is_playing;
 
         let status_event = AudioThreadEvent::LoadAudio {
             music_id: song_data.get_id(),
