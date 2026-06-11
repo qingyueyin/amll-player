@@ -3,8 +3,6 @@ use std::sync::LazyLock;
 use amll_player_core::AudioThreadEventMessage;
 use amll_player_core::AudioThreadMessage;
 use amll_player_core::{AudioPlayer, AudioPlayerConfig, AudioPlayerHandle};
-use rodio::DeviceSinkBuilder;
-use rodio::MixerDeviceSink;
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::RwLock;
 use tracing::error;
@@ -57,20 +55,25 @@ pub fn init_local_player<R: Runtime>(app: AppHandle<R>) {
             info!("Audio thread: NDK context ready, opening audio device.");
         }
 
-        let stream = DeviceSinkBuilder::open_default_sink().expect("无法创建默认的音频输出流");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("创建 Tokio 运行时失败");
 
-        runtime.block_on(local_player_main(app, stream));
+        runtime.block_on(local_player_main(app));
     });
 }
 
-async fn local_player_main<R: Runtime>(app: AppHandle<R>, stream: MixerDeviceSink) {
+async fn local_player_main<R: Runtime>(app: AppHandle<R>) {
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let player = AudioPlayer::new(AudioPlayerConfig {}, stream, evt_tx);
+    let player = match AudioPlayer::new(AudioPlayerConfig {}, evt_tx) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("初始化 Cpal 音频设备失败: {e:?}");
+            return;
+        }
+    };
 
     let handler = player.handler();
     PLAYER_HANDLER.write().await.replace(handler);

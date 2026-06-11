@@ -4,7 +4,7 @@ use std::{
     io::{Read, Seek},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -12,47 +12,67 @@ use std::{
 use super::fft_player::FFTPlayer;
 use crate::{
     AudioPlayerEventSender, AudioPlayerMessageReceiver, AudioPlayerMessageSender, AudioThreadEvent,
-    AudioThreadEventMessage, AudioThreadMessage, SongData,
-    audio_quality::AudioQuality,
-    ffmpeg_decoder::{FFmpegDecoder, FFmpegDecoderHandle},
-    media_controls::SystemMediaManager,
+    AudioThreadEventMessage, AudioThreadMessage, SongData, audio_quality::AudioQuality,
+    ffmpeg_decoder::FFmpegDecoder, media_controls::SystemMediaManager,
 };
 use anyhow::Context;
+use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use now_playing_controls::model::SystemMediaEvent;
 use parking_lot::RwLock as ParkingLotRwLock;
-use rodio::{MixerDeviceSink, Player};
+use ringbuf::traits::Consumer;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock as TokioRwLock;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{RwLock as TokioRwLock, mpsc::UnboundedReceiver, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub struct AudioPlayer {
     evt_sender: AudioPlayerEventSender,
     msg_sender: AudioPlayerMessageSender,
     msg_receiver: AudioPlayerMessageReceiver,
-    audio_player: Arc<Player>,
+
+    cpal_device: cpal::Device,
+    cpal_config: cpal::StreamConfig,
+    current_stream: Option<cpal::Stream>,
+    cpal_state: CpalCallbackState,
+    target_channels: u16,
+    target_sample_rate: u32,
+
+    is_playing_tx: watch::Sender<bool>,
+    is_playing_rx: watch::Receiver<bool>,
+    current_song_token: Option<CancellationToken>,
+    cancel_token: CancellationToken,
+
     media_manager: Arc<SystemMediaManager>,
-    current_decoder_handle: Option<FFmpegDecoderHandle>,
-    stream_handle: MixerDeviceSink,
-    volume: f64,
+    current_decoder_handle: Option<FFmpegDecoder>,
+    volume: f32,
     current_song: Option<SongData>,
     current_audio_info: Arc<TokioRwLock<AudioInfo>>,
     current_audio_quality: Arc<TokioRwLock<AudioQuality>>,
     playback_state: Arc<ParkingLotRwLock<PlaybackState>>,
-    cancel_token: CancellationToken,
-
     npc_event_rx: Option<UnboundedReceiver<SystemMediaEvent>>,
     fft_player: Arc<ParkingLotRwLock<FFTPlayer>>,
-    target_channels: u16,
-    target_sample_rate: u32,
-
     custom_song_loader: Option<Arc<CustomSongLoaderFn>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CpalCallbackState {
+    pub volume_bits: Arc<AtomicU32>,
+    pub track_finished: Arc<AtomicBool>,
+    pub consumed_frames: Arc<AtomicU64>,
+}
+
+impl Default for CpalCallbackState {
+    fn default() -> Self {
+        Self {
+            volume_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            track_finished: Arc::new(AtomicBool::new(false)),
+            consumed_frames: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 #[derive(Default, Debug)]
 pub struct PlaybackState {
-    pub is_playing: bool,
     pub base_time_sec: f64,
     pub samples_counter: Option<Arc<AtomicU64>>,
 }
@@ -96,133 +116,126 @@ pub struct AudioPlayerConfig {}
 impl AudioPlayer {
     pub fn new(
         _config: AudioPlayerConfig,
-        handle: MixerDeviceSink,
         evt_sender: AudioPlayerEventSender,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let (msg_sender, msg_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let audio_player = Arc::new(Player::connect_new(handle.mixer()));
 
-        audio_player.pause();
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .context("未找到系统默认音频输出设备")?;
 
-        let stream_config = handle.config();
-        let target_channels = stream_config.channel_count().get();
-        let target_sample_rate = stream_config.sample_rate().get();
+        let default_config = device.default_output_config()?;
+        let target_channels = default_config.channels();
+        let target_sample_rate = default_config.sample_rate();
+        let cpal_config: cpal::StreamConfig = default_config.into();
 
-        info!("音频输出设备 声道数:{target_channels}, 采样率:{target_sample_rate}");
+        info!(
+            "初始化 Cpal 音频设备: {}, 声道数: {}, 采样率: {}",
+            device.description()?.name(),
+            target_channels,
+            target_sample_rate
+        );
 
         let current_audio_info = Arc::new(TokioRwLock::new(AudioInfo::default()));
         let current_audio_quality = Arc::new(TokioRwLock::new(AudioQuality::default()));
-        let fft_player = Arc::new(ParkingLotRwLock::new(FFTPlayer::new()));
+        let fft_player = Arc::new(ParkingLotRwLock::new(FFTPlayer::new(target_sample_rate)));
         let playback_state = Arc::new(ParkingLotRwLock::new(PlaybackState::default()));
+        let cpal_state = CpalCallbackState::default();
 
         let (manager, npc_event_rx) = SystemMediaManager::new();
         let media_manager = Arc::new(manager);
 
+        let (is_playing_tx, is_playing_rx) = watch::channel(false);
+        let mut is_playing_rx_for_timeline = is_playing_rx.clone();
+
         let audio_info_reader = current_audio_info.clone();
         let emitter_pos = AudioPlayerEventEmitter::new(evt_sender.clone());
         let media_manager_for_task = media_manager.clone();
-        let playback_state_for_task = playback_state.clone();
+        let playback_state_for_timeline = playback_state.clone();
         let cancel_token = CancellationToken::new();
-
         let timeline_token = cancel_token.clone();
+
         tokio::task::spawn(async move {
             let mut time_it = tokio::time::interval(Duration::from_secs(1));
 
             loop {
+                if !*is_playing_rx_for_timeline.borrow() {
+                    tokio::select! {
+                        _ = timeline_token.cancelled() => { break; }
+                        res = is_playing_rx_for_timeline.changed() => {
+                            if res.is_err() { break; }
+                            continue;
+                        }
+                    }
+                }
+
                 tokio::select! {
-                    _ = timeline_token.cancelled() => {
-                        break;
+                    _ = timeline_token.cancelled() => break,
+                    res = is_playing_rx_for_timeline.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+
+                        continue;
                     }
                     _ = time_it.tick() => {
-                        let (is_playing, base_time, counter_clone) = {
-                            let state = playback_state_for_task.read();
-                            (state.is_playing, state.base_time_sec, state.samples_counter.clone())
+                        let (base_time, counter_clone) = {
+                            let state = playback_state_for_timeline.read();
+                            (state.base_time_sec, state.samples_counter.clone())
                         };
 
-                        if is_playing {
-                            let duration = audio_info_reader.read().await.duration;
-                            if duration > 0.0 {
-                                let played_time = if let Some(counter) = &counter_clone {
-                                    let samples = counter.load(Ordering::Relaxed) as f64;
-                                    let rate = target_sample_rate as f64;
-                                    let ch = target_channels as f64;
-                                    samples / (rate * ch)
-                                } else {
-                                    0.0
-                                };
-
-                                let local_current_pos = (base_time + played_time).min(duration);
-
-                                let _ = emitter_pos
-                                    .emit(AudioThreadEvent::PlayPosition {
-                                        position: local_current_pos,
-                                    })
-                                    .await;
-
-                                media_manager_for_task.update_timeline(
-                                    local_current_pos,
-                                    duration,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        let fft_player_clone = fft_player.clone();
-        let emitter_clone = AudioPlayerEventEmitter::new(evt_sender.clone());
-        let fft_token = cancel_token.clone();
-        tokio::task::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(50));
-            let mut fft_buffer = vec![0.0; 128];
-
-            loop {
-                tokio::select! {
-                    _ = fft_token.cancelled() => {
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        let data_to_send: Option<Vec<f32>> = {
-                            if let Some(mut player) = fft_player_clone.try_write() {
-                                if player.has_data() && player.read(&mut fft_buffer) {
-                                    Some(fft_buffer.clone())
-                                } else {
-                                    None
-                                }
+                        let duration = audio_info_reader.read().await.duration;
+                        if duration > 0.0 {
+                            let played_time = if let Some(counter) = &counter_clone {
+                                let samples = counter.load(Ordering::Relaxed) as f64;
+                                let rate = target_sample_rate as f64;
+                                let ch = target_channels as f64;
+                                samples / (rate * ch)
                             } else {
-                                None
-                            }
-                        };
+                                0.0
+                            };
 
-                        if let Some(data) = data_to_send {
-                            let _ = emitter_clone.emit(AudioThreadEvent::FFTData { data }).await;
+                            let local_current_pos = (base_time + played_time).min(duration);
+
+                            let _ = emitter_pos
+                                .emit(AudioThreadEvent::PlayPosition {
+                                    position: local_current_pos,
+                                })
+                                .await;
+
+                            media_manager_for_task.update_timeline(local_current_pos, duration);
                         }
                     }
                 }
             }
         });
 
-        Self {
+        Ok(Self {
             evt_sender,
             msg_sender,
             msg_receiver,
-            stream_handle: handle,
-            audio_player,
+            cpal_device: device,
+            cpal_config,
+            current_stream: None,
+            cpal_state,
+            target_channels,
+            target_sample_rate,
+            is_playing_tx,
+            is_playing_rx,
+            current_song_token: None,
+            cancel_token,
+            media_manager,
             current_decoder_handle: None,
             volume: 1.0,
             current_song: None,
             current_audio_info,
             current_audio_quality,
             playback_state,
-            cancel_token,
             npc_event_rx,
             fft_player,
-            target_channels,
-            target_sample_rate,
-            media_manager,
             custom_song_loader: None,
-        }
+        })
     }
 
     pub fn set_custom_song_loader(&mut self, loader: CustomSongLoaderFn) {
@@ -265,17 +278,23 @@ impl AudioPlayer {
                     } else {
                         self.npc_event_rx = None;
                     }
-                }
+                },
                 _ = check_end_interval.tick() => {
-                    if self.audio_player.empty() && !self.audio_player.is_paused() && self.current_song.is_some() {
+                    if self.cpal_state.track_finished.load(Ordering::Acquire) && self.current_song.is_some() {
+                        self.current_stream = None;
 
                         {
                             let mut state = self.playback_state.write();
-                            state.is_playing = false;
                             state.base_time_sec = 0.0;
                         }
 
                         self.current_song = None;
+
+                        self.cpal_state
+                            .track_finished
+                            .store(false, Ordering::Release);
+
+                        let _ = self.is_playing_tx.send(false);
 
                         if let Err(e) = self.emitter().emit(AudioThreadEvent::TrackEnded).await {
                             warn!("发送 TrackEnded 事件失败：{e:?}");
@@ -294,31 +313,37 @@ impl AudioPlayer {
         if let Some(ref data) = msg.data {
             match data {
                 AudioThreadMessage::ResumeAudio => {
-                    self.audio_player.play();
-                    self.playback_state.write().is_playing = true;
+                    if let Some(stream) = &self.current_stream {
+                        let _ = stream.play();
+                    }
+                    let _ = self.is_playing_tx.send(true);
                     self.media_manager.update_play_state(true);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus { is_playing: true })
                         .await;
                 }
                 AudioThreadMessage::PauseAudio => {
-                    self.audio_player.pause();
-                    self.playback_state.write().is_playing = false;
+                    if let Some(stream) = &self.current_stream {
+                        let _ = stream.pause();
+                    }
+                    let _ = self.is_playing_tx.send(false);
                     self.media_manager.update_play_state(false);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus { is_playing: false })
                         .await;
                 }
                 AudioThreadMessage::ResumeOrPauseAudio => {
-                    let was_paused = self.audio_player.is_paused();
-                    if was_paused {
-                        self.audio_player.play();
-                    } else {
-                        self.audio_player.pause();
+                    let is_playing_now = !*self.is_playing_rx.borrow();
+
+                    if let Some(stream) = &self.current_stream {
+                        if is_playing_now {
+                            let _ = stream.play();
+                        } else {
+                            let _ = stream.pause();
+                        }
                     }
 
-                    let is_playing_now = was_paused;
-                    self.playback_state.write().is_playing = is_playing_now;
+                    let _ = self.is_playing_tx.send(is_playing_now);
                     self.media_manager.update_play_state(is_playing_now);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus {
@@ -333,16 +358,20 @@ impl AudioPlayer {
                         if handle.seek(seek_pos).is_err() {
                             warn!("发送跳转命令失败, 解码器可能已关闭");
                         } else {
+                            self.cpal_state
+                                .track_finished
+                                .store(false, Ordering::Release);
+                            self.cpal_state.consumed_frames.store(0, Ordering::Release);
+
                             let fft_player_clone = self.fft_player.clone();
                             tokio::task::spawn_blocking(move || {
                                 fft_player_clone.write().clear();
                             })
                             .await?;
-                            let is_playing = !self.audio_player.is_paused();
 
+                            let is_playing = *self.is_playing_rx.borrow();
                             {
                                 let mut state = self.playback_state.write();
-                                state.is_playing = is_playing;
                                 state.base_time_sec = *position;
                                 if let Some(counter) = &state.samples_counter {
                                     counter.store(0, Ordering::SeqCst);
@@ -360,11 +389,14 @@ impl AudioPlayer {
                     self.start_playing_song(true).await?;
                 }
                 AudioThreadMessage::SetVolume { volume } => {
-                    self.volume = volume.clamp(0.0, 1.0);
-                    self.audio_player.set_volume(self.volume as f32);
+                    self.volume = (*volume as f32).clamp(0.0, 1.0);
+                    self.cpal_state
+                        .volume_bits
+                        .store(self.volume.to_bits(), Ordering::Relaxed);
+
                     let _ = emitter
                         .emit(AudioThreadEvent::VolumeChanged {
-                            volume: self.volume,
+                            volume: self.volume as f64,
                         })
                         .await;
                 }
@@ -380,12 +412,13 @@ impl AudioPlayer {
                     self.media_manager.set_enabled(*enabled);
                 }
                 AudioThreadMessage::StopAudio => {
-                    self.audio_player.pause();
+                    self.current_stream = None;
+
                     {
                         let mut state = self.playback_state.write();
-                        state.is_playing = false;
                         state.base_time_sec = 0.0;
                     }
+                    let _ = self.is_playing_tx.send(false);
                     self.media_manager.update_play_state(false);
                     let _ = emitter
                         .emit(AudioThreadEvent::PlayStatus { is_playing: false })
@@ -417,17 +450,13 @@ impl AudioPlayer {
 
     async fn start_playing_song(&mut self, clear_sink: bool) -> anyhow::Result<()> {
         if clear_sink {
-            self.audio_player.stop();
-
+            self.current_stream = None;
+            self.current_decoder_handle = None;
             let fft_player_clone = self.fft_player.clone();
             tokio::task::spawn_blocking(move || {
                 fft_player_clone.write().clear();
             })
             .await?;
-
-            self.audio_player = Arc::new(Player::connect_new(self.stream_handle.mixer()));
-            self.audio_player.set_volume(self.volume as f32);
-            self.current_decoder_handle = None;
         }
 
         let song_data = self.current_song.clone().context("没有当前歌曲可播放")?;
@@ -454,29 +483,21 @@ impl AudioPlayer {
 
         let target_channels = self.target_channels;
         let target_sample_rate = self.target_sample_rate;
-        let fft_player_clone = self.fft_player.clone();
 
         let source_result = tokio::task::spawn_blocking(move || {
-            FFmpegDecoder::new(
-                source_stream,
-                fft_player_clone,
-                target_channels,
-                target_sample_rate,
-            )
+            FFmpegDecoder::spawn(source_stream, target_channels, target_sample_rate)
         })
         .await?;
 
-        let (source, handle, samples_counter) = source_result?;
-        self.current_decoder_handle = Some(handle);
-
+        let spawned = source_result?;
+        self.current_decoder_handle = Some(spawned.handle);
         {
             let mut state = self.playback_state.write();
-            state.samples_counter = Some(samples_counter);
+            state.samples_counter = Some(spawned.samples_counter);
             state.base_time_sec = 0.0;
         }
-
-        let mut info = source.audio_info();
-        let quality = source.audio_quality();
+        let mut info = spawned.source.audio_info();
+        let quality = spawned.source.audio_quality();
 
         if let Some(preloaded) = preloaded_info {
             if !preloaded.name.is_empty() {
@@ -506,32 +527,158 @@ impl AudioPlayer {
         *self.current_audio_info.write().await = info.clone();
         *self.current_audio_quality.write().await = quality.clone();
 
-        self.audio_player.append(source);
+        let mut audio_iter = spawned.source;
+        let cpal_state_clone = self.cpal_state.clone();
+
+        cpal_state_clone
+            .track_finished
+            .store(false, Ordering::Release);
+        cpal_state_clone.consumed_frames.store(0, Ordering::Release);
+        cpal_state_clone
+            .volume_bits
+            .store(self.volume.to_bits(), Ordering::Relaxed);
+
+        let channels = target_channels as u64;
+
+        let stream = self.cpal_device.build_output_stream(
+            &self.cpal_config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let current_volume =
+                    f32::from_bits(cpal_state_clone.volume_bits.load(Ordering::Relaxed));
+                let mut eof_reached = false;
+                let mut local_consumed_samples = 0;
+
+                for sample in data.iter_mut() {
+                    if let Some(s) = audio_iter.next() {
+                        *sample = s * current_volume;
+                        local_consumed_samples += 1;
+                    } else {
+                        *sample = 0.0;
+                        eof_reached = true;
+                    }
+                }
+
+                if local_consumed_samples > 0 {
+                    let frames_played = local_consumed_samples / channels;
+                    cpal_state_clone
+                        .consumed_frames
+                        .fetch_add(frames_played, Ordering::Relaxed);
+                }
+
+                if eof_reached {
+                    cpal_state_clone
+                        .track_finished
+                        .store(true, Ordering::Relaxed);
+                }
+            },
+            |err| error!("Cpal 音频流发生错误: {err}"),
+            None,
+        )?;
+
+        stream.play()?;
+
+        self.current_stream = Some(stream);
+
+        self.spawn_fft_pacemaker(spawned.fft_consumer, target_sample_rate);
 
         self.media_manager.update_metadata(&info);
+        self.media_manager.update_play_state(true);
+        let _ = self.is_playing_tx.send(true);
 
-        let is_playing = !self.audio_player.is_paused();
-        self.media_manager.update_play_state(is_playing);
-
-        self.playback_state.write().is_playing = is_playing;
-
-        let status_event = AudioThreadEvent::LoadAudio {
-            music_id: song_data.get_id(),
-            music_info: Box::new(info),
-            quality,
-        };
-        self.emitter().emit(status_event).await?;
         self.emitter()
-            .emit(AudioThreadEvent::PlayStatus { is_playing })
+            .emit(AudioThreadEvent::LoadAudio {
+                music_id: song_data.get_id(),
+                music_info: Box::new(info),
+                quality,
+            })
+            .await?;
+        self.emitter()
+            .emit(AudioThreadEvent::PlayStatus { is_playing: true })
             .await?;
 
         Ok(())
+    }
+
+    fn spawn_fft_pacemaker<C>(&mut self, mut fft_consumer: C, target_sample_rate: u32)
+    where
+        C: Consumer<Item = f32> + Send + 'static,
+    {
+        if let Some(old_token) = self.current_song_token.take() {
+            old_token.cancel();
+        }
+
+        let song_token = CancellationToken::new();
+        self.current_song_token = Some(song_token.clone());
+
+        let cpal_state_fft = self.cpal_state.clone();
+        let fft_player_clone = self.fft_player.clone();
+        let emitter_fft = self.emitter();
+        let mut is_playing_rx = self.is_playing_rx.clone();
+
+        tokio::task::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            let mut last_consumed = 0;
+            let mut pull_buf = vec![0.0; 4096];
+
+            {
+                *fft_player_clone.write() = FFTPlayer::new(target_sample_rate);
+            }
+
+            loop {
+                if !*is_playing_rx.borrow() {
+                    tokio::select! {
+                        _ = song_token.cancelled() => break,
+                        res = is_playing_rx.changed() => {
+                            if res.is_err() { break; }
+                            continue;
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    _ = song_token.cancelled() => break,
+                    res = is_playing_rx.changed() => {
+                        if res.is_err() { break; }
+                        continue;
+                    }
+                    _ = interval.tick() => {
+                        let current_frames = cpal_state_fft.consumed_frames.load(Ordering::Acquire);
+                        let diff = current_frames.saturating_sub(last_consumed) as usize;
+                        last_consumed = current_frames;
+
+                        if diff > 0 {
+                            let mut pulled_total = 0;
+                            while pulled_total < diff {
+                                let to_pull = (diff - pulled_total).min(pull_buf.len());
+                                let n = fft_consumer.pop_slice(&mut pull_buf[..to_pull]);
+                                if n == 0 {
+                                    break;
+                                }
+
+                                fft_player_clone.write().push_samples(&pull_buf[..n]);
+                                pulled_total += n;
+                            }
+
+                            let mut fft_result = vec![0.0; 128];
+                            if fft_player_clone.write().read(&mut fft_result) {
+                                let _ = emitter_fft
+                                    .emit(AudioThreadEvent::FFTData { data: fft_result })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 
 impl Drop for AudioPlayer {
     fn drop(&mut self) {
         self.cancel_token.cancel();
+        if let Some(token) = &self.current_song_token {
+            token.cancel();
+        }
     }
 }
 

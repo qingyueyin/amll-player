@@ -1,13 +1,13 @@
 use spectrum_analyzer::*;
-use std::{collections::VecDeque, time::Instant};
+use tracing::error;
 
 /// 一个接收音频 PCM 数据并转换成频谱的伪播放结构
 /// 该结构会将传入的音频数据转换为单通道音频数据，然后进行频谱分析
 pub struct FFTPlayer {
-    last_fft_time: Instant,
+    sliding_window: [f32; 2048],
     result_buf: [f32; 2048],
-    pcm_queue: VecDeque<f32>,
     freq_range: (f32, f32),
+    sample_rate: u32,
 }
 
 // numpy.interp()
@@ -48,53 +48,46 @@ fn vec_interp(src: &[f32], dst: &mut [f32]) {
 }
 
 impl FFTPlayer {
-    pub fn new() -> Self {
+    pub fn new(sample_rate: u32) -> Self {
         Self {
-            last_fft_time: Instant::now(),
+            sliding_window: [0.0; 2048],
             result_buf: [0.0; 2048],
-            pcm_queue: VecDeque::with_capacity(4096),
             freq_range: (80.0, 2000.0),
+            sample_rate,
         }
     }
 
-    pub fn has_data(&self) -> bool {
-        !self.pcm_queue.is_empty()
-    }
-
     pub fn clear(&mut self) {
-        self.pcm_queue.clear();
+        self.sliding_window.fill(0.0);
+        self.result_buf.fill(0.0);
     }
 
     pub fn set_freq_range(&mut self, start_freq: f32, end_freq: f32) {
         self.freq_range = (start_freq, end_freq);
     }
 
-    pub fn push_samples(&mut self, samples: &[f32]) {
-        self.pcm_queue.extend(samples);
+    pub fn push_samples(&mut self, new_samples: &[f32]) {
+        let n = new_samples.len();
+        if n == 0 {
+            return;
+        }
+
+        if n >= 2048 {
+            self.sliding_window
+                .copy_from_slice(&new_samples[n - 2048..n]);
+        } else {
+            self.sliding_window.copy_within(n..2048, 0);
+            self.sliding_window[2048 - n..2048].copy_from_slice(new_samples);
+        }
     }
 
     pub fn read(&mut self, buf: &mut [f32]) -> bool {
-        if self.pcm_queue.len() < 2048 {
-            self.last_fft_time = Instant::now();
-            return false;
-        }
-
         let (start_freq, end_freq) = self.freq_range;
-
-        let mut fft_buf = [0.0; 2048];
-        self.pcm_queue
-            .iter()
-            .take(2048)
-            .enumerate()
-            .for_each(|(i, v)| {
-                fft_buf[i] = *v;
-            });
-
-        let fft_buf = windows::hamming_window(&fft_buf);
+        let fft_window = windows::hamming_window(&self.sliding_window);
 
         match samples_fft_to_spectrum(
-            &fft_buf,
-            44100,
+            &fft_window,
+            self.sample_rate,
             FrequencyLimit::Range(start_freq, end_freq),
             Some(&scaling::divide_by_N_sqrt),
         ) {
@@ -102,28 +95,18 @@ impl FFTPlayer {
                 let result_buf_len = self.result_buf.len() as f32;
                 let freq_min = spec.min_fr().val();
                 let freq_max = spec.max_fr().val();
-                let freq_range = freq_max - freq_min;
+                let freq_range_val = freq_max - freq_min;
                 self.result_buf.iter_mut().enumerate().for_each(|(i, v)| {
-                    let freq = i as f32 / result_buf_len * freq_range + freq_min;
+                    let freq = i as f32 / result_buf_len * freq_range_val + freq_min;
                     let freq = freq.clamp(freq_min, freq_max);
                     *v += spec.freq_val_exact(freq).val();
                     *v /= 2.0;
                 });
                 vec_interp(&self.result_buf, buf);
-
-                let elapsed = self.last_fft_time.elapsed();
-                let elapsed_sec = elapsed.as_secs_f64();
-                self.last_fft_time = Instant::now();
-
-                let cut_len = (elapsed_sec * 44100.0) as usize;
-                for _ in 0..cut_len {
-                    self.pcm_queue.pop_front();
-                }
-                self.pcm_queue.truncate(2048 * 4);
                 true
             }
             Err(e) => {
-                eprintln!("FFT error: {:?}", e);
+                error!("FFT error: {e:?}");
                 false
             }
         }

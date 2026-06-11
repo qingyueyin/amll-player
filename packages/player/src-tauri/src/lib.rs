@@ -429,7 +429,7 @@ fn init_logging() {
     {
         tracing_subscriber::fmt()
             .with_env_filter(
-                "amll_player=trace,wry=info,taskbar_lyric=trace,now_playing_controls=trace",
+                "amll_player=trace,wry=info,taskbar_lyric=warn,now_playing_controls=warn,ffmpeg=warn",
             )
             .with_thread_names(true)
             .with_timer(tracing_subscriber::fmt::time::uptime())

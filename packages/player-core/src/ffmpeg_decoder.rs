@@ -1,418 +1,254 @@
-use std::collections::VecDeque;
-use std::sync::atomic::AtomicU64;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, Sender, SyncSender},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
 };
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+
+use crossbeam_channel::{Sender, unbounded};
+use crossbeam_utils::sync::{Parker, Unparker};
+use ffmpeg_audio::{AudioReader, ResampleOptions};
+use ringbuf::{
+    HeapRb,
+    traits::{Consumer, Producer, Split},
+};
+use tracing::warn;
 
 use crate::{
-    CustomMediaSource, audio_quality::AudioQuality, fft_player::FFTPlayer, player::AudioInfo,
+    audio_quality::AudioQuality,
+    player::{AudioInfo, CustomMediaSource},
     utils::build_audio_info,
 };
-use anyhow::Context;
-use ffmpeg_audio::{AudioReader, ResampleOptions, Resampler};
-use parking_lot::{Condvar, Mutex, RwLock};
-use rodio::Source;
-use rodio::source::SeekError;
-use tracing::{error, warn};
 
-const FRAME_BUFFER_CAPACITY: usize = 64;
-const FFT_TARGET_RATE: u32 = 44100;
-
-struct AudioChunk {
-    player_samples: Vec<f32>,
-    fft_samples: Vec<f32>,
+#[derive(Clone, Default)]
+pub struct DecoderSharedState {
+    pub flush_req: Arc<AtomicBool>,
+    pub flush_ack: Arc<AtomicBool>,
+    pub is_eof: Arc<AtomicBool>,
+    pub is_shutdown: Arc<AtomicBool>,
+    pub info: AudioInfo,
+    pub quality: AudioQuality,
 }
 
-struct Shared {
-    buffer: Mutex<VecDeque<AudioChunk>>,
-    is_eof: AtomicBool,
-    is_stopping: AtomicBool,
-    condvar: Condvar,
-}
-
-pub enum ControlMessage {
+pub enum DecoderCommand {
     Seek(Duration),
-    Close,
 }
 
-struct DecoderMetadata {
-    total_duration: Option<Duration>,
-    audio_info: AudioInfo,
-    audio_quality: AudioQuality,
+pub struct AudioSource<C> {
+    consumer: C,
+    unparker: Unparker,
+    shared_state: DecoderSharedState,
+
+    watermark: usize,
+
+    samples_counter: Arc<AtomicU64>,
 }
 
-pub struct FFmpegDecoder {
-    shared: Arc<Shared>,
-    decoder_thread: Option<JoinHandle<()>>,
-    control_tx: Sender<ControlMessage>,
-    sample_rate: u32,
-    channels: u16,
-    total_duration: Option<Duration>,
-    audio_info: AudioInfo,
-    audio_quality: AudioQuality,
-    local_buffer: VecDeque<f32>,
-    fft_player: Arc<RwLock<FFTPlayer>>,
-    samples_played: Arc<AtomicU64>,
-}
-
-struct DecoderInitData {
-    reader: AudioReader,
-    player_resampler: Resampler,
-    fft_resampler: Resampler,
-    total_duration: Option<Duration>,
-    audio_info: AudioInfo,
-    audio_quality: AudioQuality,
-}
-
-#[derive(Clone)]
-pub struct FFmpegDecoderHandle {
-    control_tx: Sender<ControlMessage>,
-}
-
-impl FFmpegDecoderHandle {
-    pub fn seek(&self, pos: Duration) -> Result<(), mpsc::SendError<ControlMessage>> {
-        self.control_tx.send(ControlMessage::Seek(pos))
-    }
-}
-
-impl FFmpegDecoder {
-    pub fn new(
-        source: Box<dyn CustomMediaSource>,
-        fft_player: Arc<RwLock<FFTPlayer>>,
-        target_channels: u16,
-        target_sample_rate: u32,
-    ) -> anyhow::Result<(Self, FFmpegDecoderHandle, Arc<AtomicU64>)> {
-        let shared = Arc::new(Shared {
-            buffer: Mutex::new(VecDeque::with_capacity(FRAME_BUFFER_CAPACITY)),
-            is_eof: AtomicBool::new(false),
-            is_stopping: AtomicBool::new(false),
-            condvar: Condvar::new(),
-        });
-
-        let (control_tx, control_rx) = mpsc::channel();
-        let (init_tx, init_rx) = mpsc::sync_channel(1);
-
-        let decoder_thread = {
-            let shared = shared.clone();
-            thread::spawn(move || {
-                decoder_thread_entry(
-                    source,
-                    target_channels,
-                    target_sample_rate,
-                    shared,
-                    control_rx,
-                    init_tx,
-                );
-            })
-        };
-
-        let metadata = init_rx.recv()??;
-
-        let handle = FFmpegDecoderHandle {
-            control_tx: control_tx.clone(),
-        };
-
-        let samples_played = Arc::new(AtomicU64::new(0));
-
-        let decoder = Self {
-            shared,
-            decoder_thread: Some(decoder_thread),
-            control_tx,
-            sample_rate: target_sample_rate,
-            channels: target_channels,
-            total_duration: metadata.total_duration,
-            audio_info: metadata.audio_info,
-            audio_quality: metadata.audio_quality,
-            local_buffer: VecDeque::new(),
-            fft_player,
-            samples_played: samples_played.clone(),
-        };
-
-        Ok((decoder, handle, samples_played))
-    }
-
+impl<C> AudioSource<C> {
     pub fn audio_info(&self) -> AudioInfo {
-        self.audio_info.clone()
+        self.shared_state.info.clone()
     }
 
     pub fn audio_quality(&self) -> AudioQuality {
-        self.audio_quality.clone()
+        self.shared_state.quality.clone()
     }
 }
 
-fn decoder_thread_entry(
-    source: Box<dyn CustomMediaSource>,
-    target_channels: u16,
-    target_sample_rate: u32,
-    shared: Arc<Shared>,
-    control_rx: Receiver<ControlMessage>,
-    init_tx: SyncSender<anyhow::Result<DecoderMetadata>>,
-) {
-    let init_result = setup_decoder_resources(source, target_channels, target_sample_rate);
-
-    let mut init_data = match init_result {
-        Ok(data) => {
-            let metadata = DecoderMetadata {
-                total_duration: data.total_duration,
-                audio_info: data.audio_info.clone(),
-                audio_quality: data.audio_quality.clone(),
-            };
-            if init_tx.send(Ok(metadata)).is_err() {
-                return;
-            }
-            data
-        }
-        Err(e) => {
-            let _ = init_tx.send(Err(e));
-            return;
-        }
-    };
-
-    run_decoding_loop(&mut init_data, shared, &control_rx);
-}
-
-fn setup_decoder_resources(
-    source: Box<dyn CustomMediaSource>,
-    target_channels: u16,
-    target_sample_rate: u32,
-) -> anyhow::Result<DecoderInitData> {
-    let reader = AudioReader::new(source).context("初始化音频解码器失败")?;
-
-    let total_duration = reader.duration();
-    let source_info = reader.source_info().clone();
-    let audio_info = build_audio_info(&reader);
-    let audio_quality = AudioQuality::from_source_info(&source_info);
-
-    let player_opts = ResampleOptions::new()
-        .sample_rate(target_sample_rate.cast_signed())
-        .channels(target_channels as i32)
-        .format::<f32>();
-
-    let player_resampler = reader
-        .build_resampler(player_opts)
-        .context("创建播放用重采样器失败")?;
-
-    let fft_opts = ResampleOptions::new()
-        .sample_rate(FFT_TARGET_RATE.cast_signed())
-        .channels(1)
-        .format::<f32>();
-
-    let fft_resampler = reader
-        .build_resampler(fft_opts)
-        .context("创建 FFT 用重采样器失败")?;
-
-    Ok(DecoderInitData {
-        reader,
-        player_resampler,
-        fft_resampler,
-        total_duration,
-        audio_info,
-        audio_quality,
-    })
-}
-
-fn run_decoding_loop(
-    data: &mut DecoderInitData,
-    shared: Arc<Shared>,
-    control_rx: &Receiver<ControlMessage>,
-) {
-    let mut is_eof_reached = false;
-
-    'main_loop: loop {
-        if is_eof_reached {
-            match control_rx.recv() {
-                Ok(ControlMessage::Seek(pos)) => {
-                    if execute_seek(data, &shared, pos) {
-                        is_eof_reached = false;
-                    }
-                    continue 'main_loop;
-                }
-                Ok(ControlMessage::Close) => {
-                    break 'main_loop;
-                }
-                Err(_) => {
-                    break 'main_loop;
-                }
-            }
-        } else {
-            match control_rx.try_recv() {
-                Ok(ControlMessage::Seek(pos)) => {
-                    execute_seek(data, &shared, pos);
-                    continue 'main_loop;
-                }
-                Ok(ControlMessage::Close) => {
-                    break 'main_loop;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    break 'main_loop;
-                }
-            }
-        }
-
-        if shared.is_stopping.load(Ordering::Acquire) {
-            break 'main_loop;
-        }
-
-        {
-            let mut buffer = shared.buffer.lock();
-            while buffer.len() >= FRAME_BUFFER_CAPACITY
-                && !shared.is_stopping.load(Ordering::Acquire)
-            {
-                shared.condvar.wait(&mut buffer);
-            }
-
-            if shared.is_stopping.load(Ordering::Acquire) {
-                break 'main_loop;
-            }
-        }
-
-        match data.reader.receive_frame() {
-            Ok(Some(frame)) => {
-                let mut player_samples = Vec::new();
-                let mut fft_samples = Vec::new();
-
-                if data
-                    .player_resampler
-                    .process::<f32>(Some(&frame))
-                    .is_ok_and(|has_data| has_data)
-                {
-                    player_samples.extend_from_slice(data.player_resampler.output_as::<f32>());
-                }
-
-                if data
-                    .fft_resampler
-                    .process::<f32>(Some(&frame))
-                    .is_ok_and(|has_data| has_data)
-                {
-                    fft_samples.extend_from_slice(data.fft_resampler.output_as::<f32>());
-                }
-
-                let chunk = AudioChunk {
-                    player_samples,
-                    fft_samples,
-                };
-
-                let mut buffer = shared.buffer.lock();
-                buffer.push_back(chunk);
-                shared.condvar.notify_one();
-            }
-            Ok(None) => {
-                shared.is_eof.store(true, Ordering::Release);
-                shared.condvar.notify_all();
-                is_eof_reached = true;
-            }
-            Err(e) => {
-                error!("解码错误: {e}");
-                break 'main_loop;
-            }
-        }
-    }
-    shared.is_eof.store(true, Ordering::Release);
-    shared.condvar.notify_all();
-}
-
-fn execute_seek(data: &mut DecoderInitData, shared: &Arc<Shared>, pos: Duration) -> bool {
-    if data.reader.seek(pos).is_err() {
-        error!("跳转失败");
-        return false;
-    }
-    let _ = data.player_resampler.flush();
-    let _ = data.fft_resampler.flush();
-
-    let mut buffer = shared.buffer.lock();
-    buffer.clear();
-    shared.is_eof.store(false, Ordering::SeqCst);
-    shared.condvar.notify_all();
-    true
-}
-
-impl Iterator for FFmpegDecoder {
+impl<C: Consumer<Item = f32>> Iterator for AudioSource<C> {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(sample) = self.local_buffer.pop_front() {
-            self.samples_played.fetch_add(1, Ordering::Relaxed);
-            return Some(sample);
+        if self.shared_state.flush_req.load(Ordering::Acquire) {
+            self.consumer.clear();
+            self.shared_state.flush_ack.store(true, Ordering::Release);
+            return Some(0.0);
         }
 
-        let mut shared_buffer_lock = self.shared.buffer.lock();
-
-        while shared_buffer_lock.is_empty() {
-            if self.shared.is_eof.load(Ordering::Acquire)
-                || self.shared.is_stopping.load(Ordering::Acquire)
-            {
-                return None;
+        if let Some(sample) = self.consumer.try_pop() {
+            self.samples_counter.fetch_add(1, Ordering::Relaxed);
+            if self.consumer.occupied_len() < self.watermark {
+                self.unparker.unpark();
             }
-            self.shared.condvar.wait(&mut shared_buffer_lock);
+            Some(sample)
+        } else {
+            if self.shared_state.is_eof.load(Ordering::Acquire) {
+                None
+            } else {
+                self.unparker.unpark();
+                Some(0.0)
+            }
         }
-
-        let chunk = shared_buffer_lock.pop_front().unwrap();
-
-        self.shared.condvar.notify_one();
-        drop(shared_buffer_lock);
-
-        if !chunk.fft_samples.is_empty()
-            && let Some(mut player) = self.fft_player.try_write()
-        {
-            player.push_samples(&chunk.fft_samples);
-        }
-
-        self.local_buffer.extend(chunk.player_samples);
-
-        let sample = self.local_buffer.pop_front();
-        if sample.is_some() {
-            self.samples_played.fetch_add(1, Ordering::Relaxed);
-        }
-        sample
     }
 }
 
-impl Source for FFmpegDecoder {
-    fn current_span_len(&self) -> Option<usize> {
-        None
+impl<C> Drop for AudioSource<C> {
+    fn drop(&mut self) {
+        self.shared_state.is_shutdown.store(true, Ordering::Release);
+        self.unparker.unpark();
     }
+}
 
-    fn channels(&self) -> std::num::NonZeroU16 {
-        std::num::NonZeroU16::new(self.channels).expect("音频声道数为 0")
-    }
+pub struct SpawnedDecoder<C, FC> {
+    pub source: AudioSource<C>,
+    pub fft_consumer: FC,
+    pub handle: FFmpegDecoder,
+    pub samples_counter: Arc<AtomicU64>,
+}
 
-    fn sample_rate(&self) -> std::num::NonZeroU32 {
-        std::num::NonZeroU32::new(self.sample_rate).expect("音频采样率为 0")
-    }
+#[derive(Clone)]
+pub struct FFmpegDecoder {
+    cmd_tx: Sender<DecoderCommand>,
+    unparker: Unparker,
+}
 
-    fn total_duration(&self) -> Option<Duration> {
-        self.total_duration
-    }
-
-    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
-        if self.control_tx.send(ControlMessage::Seek(pos)).is_err() {
-            warn!("无法发送跳转命令，解码器线程可能已 panic");
-            return Err(SeekError::NotSupported {
-                underlying_source: "FFmpegDecoder",
-            });
-        }
-        self.local_buffer.clear();
-        self.samples_played.store(0, Ordering::SeqCst);
-
+impl FFmpegDecoder {
+    pub fn seek(&self, target: Duration) -> anyhow::Result<()> {
+        self.cmd_tx.send(DecoderCommand::Seek(target))?;
+        self.unparker.unpark();
         Ok(())
     }
-}
 
-impl Drop for FFmpegDecoder {
-    fn drop(&mut self) {
-        self.shared.is_stopping.store(true, Ordering::Release);
-        self.shared.condvar.notify_all();
-        let _ = self.control_tx.send(ControlMessage::Close);
+    pub fn spawn<T: CustomMediaSource>(
+        source: T,
+        target_channels: u16,
+        target_sample_rate: u32,
+    ) -> anyhow::Result<
+        SpawnedDecoder<
+            impl Consumer<Item = f32> + Send + 'static,
+            impl Consumer<Item = f32> + Send + 'static,
+        >,
+    > {
+        let mut reader = AudioReader::new(source)?;
 
-        if let Some(handle) = self.decoder_thread.take()
-            && let Err(e) = handle.join()
-        {
-            error!("解码器线程 panic: {e:?}");
-        }
+        let src_info = reader.source_info();
+
+        let info = build_audio_info(&reader);
+        let quality = AudioQuality::from_source_info(src_info);
+
+        let audio_options = ResampleOptions::new()
+            .sample_rate(target_sample_rate.cast_signed())
+            .channels(target_channels.cast_signed().into())
+            .format::<f32>();
+
+        let fft_options = ResampleOptions::new()
+            .sample_rate(target_sample_rate.cast_signed())
+            .channels(1)
+            .format::<f32>();
+
+        let mut audio_resampler = reader.build_resampler(audio_options)?;
+        let mut fft_resampler = reader.build_resampler(fft_options)?;
+
+        let buffer_capacity = (target_sample_rate * target_channels as u32 * 3 / 2) as usize;
+        let audio_rb = HeapRb::<f32>::new(buffer_capacity);
+        let (mut audio_producer, audio_consumer) = audio_rb.split();
+
+        let fft_buffer_capacity = (target_sample_rate * 3 / 2) as usize;
+        let fft_rb = HeapRb::<f32>::new(fft_buffer_capacity);
+        let (mut fft_producer, fft_consumer) = fft_rb.split();
+
+        let (cmd_tx, cmd_rx) = unbounded::<DecoderCommand>();
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
+
+        let shared_state = DecoderSharedState {
+            info,
+            quality,
+            ..Default::default()
+        };
+
+        let samples_counter = Arc::new(AtomicU64::new(0));
+
+        let source = AudioSource {
+            consumer: audio_consumer,
+            unparker: unparker.clone(),
+            shared_state: shared_state.clone(),
+            watermark: buffer_capacity / 2,
+            samples_counter: samples_counter.clone(),
+        };
+
+        let handle = FFmpegDecoder {
+            cmd_tx,
+            unparker: unparker.clone(),
+        };
+
+        thread::spawn(move || {
+            loop {
+                if shared_state.is_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        DecoderCommand::Seek(target) => {
+                            shared_state.flush_req.store(true, Ordering::Release);
+                            while !shared_state.flush_ack.load(Ordering::Acquire) {
+                                if shared_state.is_shutdown.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                thread::yield_now();
+                            }
+
+                            let _ = reader.seek(target);
+                            let _ = audio_resampler.flush();
+                            let _ = fft_resampler.flush();
+
+                            shared_state.flush_req.store(false, Ordering::Release);
+                            shared_state.flush_ack.store(false, Ordering::Release);
+                            shared_state.is_eof.store(false, Ordering::Release);
+                        }
+                    }
+                }
+
+                if shared_state.is_eof.load(Ordering::Acquire) {
+                    parker.park();
+                    continue;
+                }
+
+                match reader.receive_frame() {
+                    Ok(Some(frame)) => {
+                        if let Ok(true) = fft_resampler.process::<f32>(Some(&frame)) {
+                            let fft_data = fft_resampler.output_as::<f32>();
+                            let _ = fft_producer.push_slice(fft_data);
+                        }
+
+                        if let Ok(true) = audio_resampler.process::<f32>(Some(&frame)) {
+                            let audio_data = audio_resampler.output_as::<f32>();
+                            let mut written = 0;
+                            while written < audio_data.len() {
+                                if shared_state.is_shutdown.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                if !cmd_rx.is_empty() {
+                                    break;
+                                }
+
+                                let pushed = audio_producer.push_slice(&audio_data[written..]);
+                                written += pushed;
+
+                                if pushed == 0 {
+                                    parker.park();
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        shared_state.is_eof.store(true, Ordering::Release);
+                    }
+                    Err(e) => {
+                        warn!("解码线程发生错误: {e:?}");
+                        shared_state.is_eof.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+
+        Ok(SpawnedDecoder {
+            source,
+            fft_consumer,
+            handle,
+            samples_counter,
+        })
     }
 }
