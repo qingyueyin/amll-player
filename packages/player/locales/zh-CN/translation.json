@@ -21,6 +21,34 @@
 			"windowAlwaysOnTop": "窗口置顶"
 		},
 		"loadAudioError": "播放后端加载音频失败\n{error}",
+		"migrationDialog": {
+			"completedDesc": "成功导入 {count} 项数据。",
+			"completedDescDefault": "迁移已完成。",
+			"completedDescWithFailures": "成功导入 {count} 项数据，{failed} 项失败。",
+			"completedTitle": "迁移完成",
+			"deleteOldData": "删除",
+			"deleteOldDataLabel": "是否删除旧版本的数据以释放空间？你将无法使用旧版本的数据。",
+			"deleteOldDataOnSkip": "同时删除旧版本数据",
+			"description": "检测到旧版本 AMLL Player 的歌单数据，是否需要迁移？",
+			"doNotClose": "迁移过程中请勿关闭应用",
+			"dontAskAgain": "不再提示",
+			"errorListTitle": "以下项目迁移失败：",
+			"failedDesc": "迁移过程中发生错误：",
+			"failedItems": "（{count} 项失败）",
+			"failedRetryHint": "你可以在下次启动应用时重试。",
+			"failedTitle": "迁移失败",
+			"keepOldData": "保留",
+			"phaseDone": "迁移完成",
+			"phasePlaylists": "正在迁移播放列表",
+			"phaseSongs": "正在迁移歌曲",
+			"preparing": "准备中",
+			"progressPlaylists": "播放列表 {current}/{total}",
+			"progressSongs": "歌曲 {current}/{total}",
+			"skip": "跳过",
+			"start": "开始迁移",
+			"summary": "将迁移 {songs} 首歌曲和 {playlists} 个播放列表",
+			"title": "数据迁移"
+		},
 		"openMenuViaRightClick": "请右键歌词页任意位置来打开菜单哦！",
 		"qualityTag": {
 			"hires": "高解析度无损",
@@ -148,6 +176,7 @@
 			},
 			"cover": {
 				"changeCoverToAuto": "更换成自动封面",
+				"mediaFiles": "媒体文件",
 				"uploadCoverImage": "上传封面图片"
 			},
 			"music": {

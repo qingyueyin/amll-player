@@ -21,6 +21,34 @@
 			"windowAlwaysOnTop": "窗口置顶"
 		},
 		"loadAudioError": "播放后端加载音频失败\n{error}",
+		"migrationDialog": {
+			"completedDesc": "{count} 件のデータをインポートしました。",
+			"completedDescDefault": "移行が完了しました。",
+			"completedDescWithFailures": "{count} 件のデータをインポートしました、{failed} 件失敗しました。",
+			"completedTitle": "移行完了",
+			"deleteOldData": "削除",
+			"deleteOldDataLabel": "旧バージョンのデータを削除してディスク容量を解放しますか？旧バージョンのデータは使用できなくなります。",
+			"deleteOldDataOnSkip": "旧データも削除する",
+			"description": "旧バージョンの AMLL Player のプレイリストデータが検出されました。移行しますか？",
+			"doNotClose": "移行中はアプリを閉じないでください",
+			"dontAskAgain": "今後表示しない",
+			"errorListTitle": "以下の項目の移行に失敗しました：",
+			"failedDesc": "移行中にエラーが発生しました：",
+			"failedItems": "（{count} 件失敗）",
+			"failedRetryHint": "次回アプリ起動時に再試行できます。",
+			"failedTitle": "移行失敗",
+			"keepOldData": "保持",
+			"phaseDone": "移行完了",
+			"phasePlaylists": "プレイリストを移行中",
+			"phaseSongs": "楽曲を移行中",
+			"preparing": "準備中",
+			"progressPlaylists": "プレイリスト {current}/{total}",
+			"progressSongs": "楽曲 {current}/{total}",
+			"skip": "スキップ",
+			"start": "移行を開始",
+			"summary": "{songs} 曲と {playlists} つのプレイリストを移行します。",
+			"title": "データ移行"
+		},
 		"openMenuViaRightClick": "歌詞ページの任意の場所を右クリックしてメニューを開きます。",
 		"qualityTag": {
 			"hires": "高解析度无损",
@@ -148,6 +176,7 @@
 			},
 			"cover": {
 				"changeCoverToAuto": "更换成自动封面",
+				"mediaFiles": "メディアファイル",
 				"uploadCoverImage": "上传封面图片"
 			},
 			"music": {

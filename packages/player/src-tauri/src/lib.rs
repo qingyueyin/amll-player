@@ -15,7 +15,8 @@ use serde::*;
 #[cfg(not(mobile))]
 use serde_json::Value;
 use tauri::{
-    AppHandle, Manager, Runtime, State, WebviewWindowBuilder, ipc::Channel, path::BaseDirectory,
+    AppHandle, Emitter, Manager, Runtime, State, WebviewWindowBuilder, ipc::Channel,
+    path::BaseDirectory,
 };
 #[cfg(desktop)]
 use tauri::{PhysicalSize, Size, utils::config::WindowEffectsConfig, window::Effect};
@@ -24,10 +25,13 @@ use tracing::*;
 
 use crate::server::AMLLWebSocketServer;
 
+mod db;
+mod db_events;
 mod player;
 mod screen_capture;
 mod server;
 mod ttml_db;
+mod utils;
 
 #[cfg(desktop)]
 mod extension_window;
@@ -96,12 +100,12 @@ pub struct MusicInfo {
     pub album: String,
     pub lyric_format: String,
     pub lyric: String,
-    pub cover: Vec<u8>,
+    pub cover_path: String,
     pub duration: f64,
 }
 
-impl From<AudioInfo> for MusicInfo {
-    fn from(v: AudioInfo) -> Self {
+impl MusicInfo {
+    fn from_audio_info(v: AudioInfo, cover_path: String) -> Self {
         Self {
             name: v.name,
             artist: v.artist,
@@ -112,7 +116,7 @@ impl From<AudioInfo> for MusicInfo {
                 "lrc".into()
             },
             lyric: v.lyric,
-            cover: v.cover.unwrap_or_default(),
+            cover_path,
             duration: v.duration,
         }
     }
@@ -189,10 +193,17 @@ async fn resolve_content_uri(
     Ok(target_path.to_string_lossy().into_owned())
 }
 
+pub(crate) fn get_covers_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .resolve("covers", BaseDirectory::AppData)
+        .map_err(|e| format!("Failed to resolve covers dir: {e}"))
+}
+
 #[tauri::command]
 async fn read_local_music_metadata(
     file_path: tauri_plugin_fs::FilePath,
     fs: State<'_, tauri_plugin_fs::Fs<tauri::Wry>>,
+    app: AppHandle,
 ) -> Result<MusicInfo, String> {
     let path_clone = file_path
         .as_path()
@@ -212,7 +223,31 @@ async fn read_local_music_metadata(
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
 
-    let mut music_info: MusicInfo = audio_info.into();
+    let cover_bytes = audio_info.cover.clone().unwrap_or_default();
+    let song_id = format!(
+        "{:x}",
+        md5::compute(
+            file_path
+                .as_path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+    );
+
+    let cover_path = if !cover_bytes.is_empty() {
+        let covers_dir = get_covers_dir(&app)?;
+        std::fs::create_dir_all(&covers_dir)
+            .map_err(|e| format!("Failed to create covers dir: {e}"))?;
+        let cover_file = covers_dir.join(format!("{song_id}.jpg"));
+        std::fs::write(&cover_file, &cover_bytes)
+            .map_err(|e| format!("Failed to save cover: {e}"))?;
+        cover_file.to_string_lossy().to_string()
+    } else {
+        String::new()
+    };
+
+    let mut music_info = MusicInfo::from_audio_info(audio_info, cover_path);
 
     if let Some(file_path_ref) = file_path.as_path()
         && music_info.lyric.is_empty()
@@ -233,6 +268,25 @@ async fn read_local_music_metadata(
     }
 
     Ok(music_info)
+}
+
+#[tauri::command]
+async fn save_cover_from_path(
+    song_id: String,
+    source_path: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let covers_dir = get_covers_dir(&app)?;
+    std::fs::create_dir_all(&covers_dir)
+        .map_err(|e| format!("Failed to create covers dir: {e}"))?;
+
+    let source = std::path::Path::new(&source_path);
+    let ext = crate::utils::cover_ext_for_path(source);
+    let cover_file = covers_dir.join(format!("{song_id}.{ext}"));
+
+    std::fs::copy(source, &cover_file).map_err(|e| format!("Failed to copy cover: {e}"))?;
+
+    Ok(cover_file.to_string_lossy().to_string())
 }
 
 async fn create_common_win<'a>(
@@ -502,10 +556,28 @@ pub fn run() {
             player::set_media_controls_enabled,
             resolve_content_uri,
             read_local_music_metadata,
+            save_cover_from_path,
             restart_app,
             sync_lyrics,
             search_lyrics,
             get_lyric_detail,
+            db::commands::get_all_playlists,
+            db::commands::get_playlist,
+            db::commands::create_playlist,
+            db::commands::update_playlist,
+            db::commands::delete_playlist,
+            db::commands::add_songs_to_playlist,
+            db::commands::remove_song_from_playlist,
+            db::commands::upsert_songs,
+            db::commands::get_song,
+            db::commands::get_songs_by_ids,
+            db::commands::update_song,
+            db::commands::get_playlist_songs,
+            db::commands::save_playlist_cover,
+            db::commands::clear_playlist_cover,
+            db::migrate::migrate_songs_batch,
+            db::migrate::migrate_playlists_batch,
+            db::cleanup::cleanup_orphaned_covers,
             #[cfg(desktop)]
             extension_window::extension_window_create,
             #[cfg(desktop)]
@@ -603,6 +675,43 @@ pub fn run() {
             }
 
             player::init_local_player(app.handle().clone());
+
+            let db_conn = tauri::async_runtime::block_on(db::init_database(app.handle()))
+                .expect("Failed to initialize database");
+            app.manage(db_conn);
+
+            {
+                let db_ref = app.state::<db::DbConnection>().inner().clone();
+                let gc_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match db::cleanup::run_cover_gc(&db_ref, &gc_app).await {
+                        Ok(result) if result.deleted > 0 => {
+                            info!(
+                                "[Startup] Cover GC: scanned {}, deleted {} orphaned covers",
+                                result.total_scanned, result.deleted
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("[Startup] Cover GC failed: {e}"),
+                    }
+                });
+            }
+
+            let app_handle = app.handle().clone();
+            let mut rx = db_events::DB_EVENT_SENDER.subscribe();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let _ = app_handle.emit("db-row-changed", &event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!("DB event broadcast lagged, {skipped} events dropped");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
 
             #[cfg(target_os = "windows")]
             app.manage(taskbar_lyric::TaskbarLyricState::default());

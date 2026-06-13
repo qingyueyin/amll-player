@@ -21,6 +21,34 @@
 			"windowAlwaysOnTop": "窗口置顶"
 		},
 		"loadAudioError": "The player backend encountered an error when loading the audio file:\n{error}",
+		"migrationDialog": {
+			"completedDesc": "Successfully imported {count} items.",
+			"completedDescDefault": "Migration completed.",
+			"completedDescWithFailures": "Successfully imported {count} items, {failed} failed.",
+			"completedTitle": "Migration Complete",
+			"deleteOldData": "Delete",
+			"deleteOldDataLabel": "Delete legacy data to free up disk space? You will not be able to use the old version's data.",
+			"deleteOldDataOnSkip": "Also delete legacy data",
+			"description": "Legacy AMLL Player playlist data detected. Would you like to migrate?",
+			"doNotClose": "Do not close the app during migration",
+			"dontAskAgain": "Don't ask again",
+			"errorListTitle": "The following items failed to migrate:",
+			"failedDesc": "An error occurred during migration:",
+			"failedItems": "（{count} items failed）",
+			"failedRetryHint": "You can retry next time you launch the app.",
+			"failedTitle": "Migration Failed",
+			"keepOldData": "Keep",
+			"phaseDone": "Migration complete",
+			"phasePlaylists": "Migrating playlists",
+			"phaseSongs": "Migrating songs",
+			"preparing": "Preparing",
+			"progressPlaylists": "Playlists {current}/{total}",
+			"progressSongs": "Songs {current}/{total}",
+			"skip": "Skip",
+			"start": "Start Migration",
+			"summary": "Will migrate {songs} songs and {playlists} playlists.",
+			"title": "Data Migration"
+		},
 		"openMenuViaRightClick": "Please right-click anywhere to open menu",
 		"qualityTag": {
 			"hires": "Hi-Res Lossless",
@@ -148,6 +176,7 @@
 			},
 			"cover": {
 				"changeCoverToAuto": "Use automatic cover",
+				"mediaFiles": "Media Files",
 				"uploadCoverImage": "Upload your own cover art"
 			},
 			"music": {
