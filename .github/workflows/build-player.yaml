@@ -458,7 +458,7 @@ jobs:
                 .filter(line => line.trim() !== "")
                 .join("\n");
               
-              return `buildSettings = {\n${newBody}\n\t\t\t\tCODE_SIGNING_ALLOWED = NO;\n\t\t\t\tCODE_SIGNING_REQUIRED = NO;\n\t\t\t\tCODE_SIGN_IDENTITY = "";\n\t\t\t\tCODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = "";\n\t\t\t};`;
+              return `buildSettings = {\n${newBody}\n\t\t\t\tCODE_SIGNING_ALLOWED = NO;\n\t\t\t\tCODE_SIGNING_REQUIRED = NO;\n\t\t\t\tCODE_SIGN_IDENTITY = "";\n\t\t\t\tCODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = "";\n\t\t\t\tCI = true;\n\t\t\t};`;
             });
 
             fs.writeFileSync(path, content, "utf8");
