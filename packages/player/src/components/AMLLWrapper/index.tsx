@@ -36,7 +36,7 @@ export const AMLLWrapper: FC = () => {
 		const handleKeyDown = (e: KeyboardEvent) => {
 			if (e.key === " ") {
 				e.preventDefault();
-				onPlayOrResume();
+				onPlayOrResume?.();
 			}
 		};
 
