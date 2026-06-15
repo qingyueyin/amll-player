@@ -52,7 +52,11 @@ tauri-plugin-http = "2"
 
 rkyv = { version = "0.7", features = ["validation"] }
 memmap2 = "0.9"
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = [
+	"rustls",
+	"json",
+	"stream",
+] }
 zip = "8.6"
 ttml_processor = "0.3"
 tempfile = "3.27"
@@ -63,11 +67,14 @@ jwalk = "0.8"
 rayon = "1.12"
 infer = "0.19"
 sea-orm = { version = "1", features = [
-	"runtime-tokio-native-tls",
+	"runtime-tokio-rustls",
 	"sqlx-sqlite",
 	"macros",
 ] }
-sea-orm-migration = { version = "1", features = ["sqlx-sqlite"] }
+sea-orm-migration = { version = "1", features = [
+	"runtime-tokio-rustls",
+	"sqlx-sqlite",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk-context = "0.1.1"
