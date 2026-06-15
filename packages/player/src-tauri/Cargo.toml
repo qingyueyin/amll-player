@@ -45,7 +45,6 @@ tauri-plugin-fs = { version = "2" }
 tauri-plugin-opener = { version = "2" }
 tauri-plugin-os = { version = "2" }
 tauri-plugin-shell = { version = "2" }
-tauri-plugin-window-state = "2"
 
 amll-player-core = { path = "../../player-core" }
 ffmpeg_audio = { git = "https://github.com/apoint123/ffmpeg-audio.git", rev = "b77e5edea026712c42d58a9dce68e531b812c63f" }
@@ -115,6 +114,7 @@ windows = { version = "0.62", features = [
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = { version = "2" }
 tauri-plugin-updater = { version = "2" }
+tauri-plugin-window-state = "2"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

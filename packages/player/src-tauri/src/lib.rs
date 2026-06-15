@@ -227,13 +227,17 @@ pub fn run() {
             })
     }
 
-    builder
+    let builder = builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_http::init())
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(tauri_plugin_http::init());
+
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_window_state::Builder::new().build());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             server::ws_reopen_connection,
             server::ws_get_connections,
