@@ -6,6 +6,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(target_os = "android")]
 pub(crate) static ANDROID_NDK_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+#[cfg(not(mobile))]
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, Runtime, path::BaseDirectory};
 use tokio::sync::RwLock;
