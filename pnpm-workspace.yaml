@@ -20,3 +20,8 @@ allowBuilds:
   "@parcel/watcher": true
   "@swc/core": true
   esbuild: true
+minimumReleaseAgeExclude:
+  - '@applemusic-like-lyrics/core@0.5.2'
+  - '@applemusic-like-lyrics/lyric@1.0.2'
+  - '@applemusic-like-lyrics/react-full@0.4.2'
+  - '@applemusic-like-lyrics/react@0.5.2'
