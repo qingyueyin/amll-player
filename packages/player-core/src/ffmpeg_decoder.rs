@@ -190,7 +190,7 @@ impl FFmpegDecoder {
                                 thread::yield_now();
                             }
 
-                            let _ = reader.seek(target);
+                            let _ = reader.seek(target, ffmpeg_audio::SeekMode::Accurate);
                             let _ = audio_resampler.flush();
                             let _ = fft_resampler.flush();
 
