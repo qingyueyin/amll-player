@@ -1,13 +1,13 @@
+import "./styles.css";
+import "react-toastify/dist/ReactToastify.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Provider } from "jotai";
 import { createRoot } from "react-dom/client";
 import { ErrorBoundary, type FallbackProps } from "react-error-boundary";
-import "react-toastify/dist/ReactToastify.css";
-import App from "./App.tsx";
 import "./i18n";
-import "./styles.css";
-import "./utils/player";
 import { toError } from "./utils/error.ts";
+import "./utils/player";
+import App from "./App.tsx";
 
 const ErrorRender = (props: FallbackProps) => {
 	console.error(props.error);

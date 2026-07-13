@@ -1,7 +1,7 @@
+import "./styles.css";
 import * as lyric from "@applemusic-like-lyrics/lyric";
 import * as amllStates from "@applemusic-like-lyrics/react-full";
 import { Theme } from "@radix-ui/themes";
-import "@radix-ui/themes/styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import * as http from "@tauri-apps/plugin-http";
 import { Provider, useStore } from "jotai";

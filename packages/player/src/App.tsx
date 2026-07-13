@@ -1,5 +1,4 @@
 import { Box, Theme } from "@radix-ui/themes";
-import "@radix-ui/themes/styles.css";
 import classNames from "classnames";
 import { useAtomValue } from "jotai";
 import { lazy, StrictMode, Suspense } from "react";
